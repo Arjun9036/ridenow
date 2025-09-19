@@ -1,67 +1,83 @@
+# Required libraries: easyocr, PyMuPDF, Pillow, numpy
 import re
 import sqlite3
-import fitz  # PyMuPDF
+import fitz      # PyMuPDF
+import easyocr
+import numpy as np
+from PIL import Image
 
-# ----- Database setup -----
+# ----- Dummy database setup (unchanged) -----
 DB_PATH = "dummy_aadhaar.db"
 
 def create_dummy_db():
-    """Sets up a simple SQLite database with a few dummy Aadhaar numbers."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS aadhaars (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             aadhaar TEXT NOT NULL UNIQUE
         )
     """)
-
-    dummy_aadhaars = [
-        "570453971532",
-        "809471964847",
-        "541309514471",
-    ]
-
+    dummy_aadhaars = ["570453971532", "809471964847", "541309514471"]
     for num in dummy_aadhaars:
         cur.execute("INSERT OR IGNORE INTO aadhaars (aadhaar) VALUES (?)", (num,))
-
     conn.commit()
     conn.close()
-    print(f"✅ Dummy database ready at {DB_PATH}")
+    print(f"✅ Dummy database created at {DB_PATH}")
 
-# ----- PDF Text Extraction -----
-def extract_text_from_pdf(pdf_path):
-    """
-    Extracts text directly from a PDF's text layer.
-    This is fast but only works for native (non-scanned) PDFs.
-    """
+# ----- Method 1: Direct Text Extraction (unchanged) -----
+def extract_direct_text_from_pdf(pdf_path):
+    """Extracts text directly from a PDF. Fast but only works for native PDFs."""
     full_text = ""
+    with fitz.open(pdf_path) as doc:
+        for page in doc:
+            full_text += page.get_text()
+    return full_text
+
+# ----- Method 2: OCR Extraction with EasyOCR (replaces Tesseract) -----
+def extract_text_with_easyocr(pdf_path, dpi=300):
+    """
+    Extracts text from a scanned PDF using EasyOCR.
+    This is slower but works for image-based documents.
+    """
+    print("Initializing EasyOCR reader... (this may take a moment on first run)")
+    # We initialize it here so it doesn't reload the model for every page
+    reader = easyocr.Reader(['en']) 
+    
+    full_text = []
+    
     try:
-        with fitz.open(pdf_path) as doc:
-            for page in doc:
-                full_text += page.get_text()
-        return full_text
+        doc = fitz.open(pdf_path)
+        for i, page in enumerate(doc):
+            print(f"Processing page {i + 1}/{len(doc)} with EasyOCR...")
+            # Convert page to a high-resolution image
+            pix = page.get_pixmap(dpi=dpi)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            img_array = np.array(img)
+
+            # Perform OCR and extract text
+            result = reader.readtext(img_array)
+            page_text = " ".join([text for bbox, text, prob in result])
+            full_text.append(page_text)
+            
+        doc.close()
+        return "\n".join(full_text)
     except Exception as e:
-        print(f"Error opening or reading PDF file: {e}")
-        return None
+        print(f"Error during EasyOCR processing: {e}")
+        return ""
 
-# ----- Aadhaar Number Finding -----
+# ----- Aadhaar extraction (unchanged) -----
 def find_aadhaar(text):
-    """Uses regex to find 12-digit numbers in the extracted text."""
-    # This regex looks for 12 digits, possibly separated by spaces or hyphens.
     matches = re.findall(r'(?:\d{4}[\s-]?){2}\d{4}', text)
-    clean_numbers = []
+    clean = []
     for m in matches:
-        # Remove any non-digit characters to get a clean 12-digit number.
         digits = re.sub(r'\D', '', m)
-        if len(digits) == 12 and digits not in clean_numbers:
-            clean_numbers.append(digits)
-    return clean_numbers
+        if len(digits) == 12 and digits not in clean:
+            clean.append(digits)
+    return clean
 
-# ----- Database Check -----
+# ----- Check in database (unchanged) -----
 def check_in_db(aadhaar_number):
-    """Checks if the given Aadhaar number exists in the database."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT * FROM aadhaars WHERE aadhaar = ?", (aadhaar_number,))
@@ -69,50 +85,51 @@ def check_in_db(aadhaar_number):
     conn.close()
     return result
 
-# ----- Main Validation Logic -----
+# ----- Main logic with Hybrid Approach (updated) -----
 def validate_aadhaar_from_pdf(pdf_path):
-    """
-    Main function to orchestrate the validation process.
-    It extracts text, finds the number, and checks it against the database.
-    """
     try:
-        # Step 1: Extract text directly from the PDF.
-        print("Attempting to extract text directly from PDF...")
-        extracted_text = extract_text_from_pdf(pdf_path)
+        # Step 1: Try the fast, direct extraction method first.
+        extracted_text = extract_direct_text_from_pdf(pdf_path)
 
-        if not extracted_text or not extracted_text.strip():
-            return "Could not extract any text from the PDF. It might be a scanned image or empty."
+        # Step 2: If direct extraction yields little text, fall back to EasyOCR.
+        if len(extracted_text.strip()) < 50:
+            print("⚠️ Direct text extraction yielded little result, falling back to EasyOCR...")
+            extracted_text = extract_text_with_easyocr(pdf_path)
+        else:
+            print("✅ Text successfully extracted directly from PDF.")
 
-        print("✅ Text successfully extracted.")
+        # Step 3: Process the extracted text to find the Aadhaar number.
+        if not extracted_text:
+             print("❌ OCR process failed to extract any text.")
+             return "Could not extract any text from the document."
 
-        # Step 2: Process the extracted text to find the Aadhaar number.
         aadhaars = find_aadhaar(extracted_text)
         aadhaar_number = aadhaars[0] if aadhaars else None
 
         if aadhaar_number:
-            print(f"✅ Aadhaar Number Found: {aadhaar_number}")
+            print(f"✅ Aadhaar Number Extracted: {aadhaar_number}")
             match = check_in_db(aadhaar_number)
             print(f"   Match in DB: {'✅' if match else '❌'}")
             
             if match:
                 return f"Aadhaar card with number {aadhaar_number} is valid and found in the database."
             else:
-                return f"Aadhaar card with number {aadhaar_number} was not found in the database."
+                return f"Aadhaar card with number {aadhaar_number} is not found in the database."
         else:
-            return "❌ No valid Aadhaar number could be found in the provided PDF."
-
+            print("❌ Aadhaar Number not found in the extracted text.")
+            return "No valid Aadhaar number could be found in the provided PDF."
     except Exception as e:
-        return f"An unexpected error occurred during validation: {str(e)}"
+        return f"An error occurred during validation: {str(e)}"
 
-# ----- Script Execution -----
+# ----- Main execution block (unchanged) -----
 if __name__ == "__main__":
     create_dummy_db()
     try:
         pdf_path = input("Enter Aadhaar PDF path: ").strip().strip('"')
-        result_message = validate_aadhaar_from_pdf(pdf_path)
+        result = validate_aadhaar_from_pdf(pdf_path)
         print("\n--- Validation Result ---")
-        print(result_message)
+        print(result)
     except FileNotFoundError:
-        print("Error: The file path you entered does not exist.")
+        print(f"Error: The file '{pdf_path}' was not found.")
     except Exception as e:
         print(f"A critical error occurred: {e}")
