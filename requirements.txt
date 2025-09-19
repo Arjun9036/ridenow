@@ -1,25 +1,25 @@
---- Web API Framework ---
+#--- Web API Framework ---
 For building the API endpoints (/validate-aadhaar, /validate-dl)
 fastapi==0.104.1
 
-For running the FastAPI application (the web server)
+#For running the FastAPI application (the web server)
 uvicorn==0.23.2
 
-Required by FastAPI for handling file uploads (UploadFile)
+#Required by FastAPI for handling file uploads (UploadFile)
 python-multipart==0.0.6
 
---- PDF and OCR Processing ---
-For reading and extracting pages from PDF files
+#--- PDF and OCR Processing ---
+#For reading and extracting pages from PDF files
 PyMuPDF==1.23.7
 
-The main OCR engine to read text from images
+#The main OCR engine to read text from images
 easyocr==1.7.2
 
-For handling image manipulation (converting PDF pages to images)
+#For handling image manipulation (converting PDF pages to images)
 Pillow==10.1.0
 
-Core library for numerical operations, required by easyocr/opencv
+#Core library for numerical operations, required by easyocr/opencv
 numpy<2.0.0
 
-Required by easyocr for image processing tasks (headless version is best for servers)
+#Required by easyocr for image processing tasks (headless version is best for servers)
 opencv-python-headless==4.12.0.88
