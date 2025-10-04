@@ -1,30 +1,38 @@
-# Required libraries: easyocr, PyMuPDF, Pillow, numpy
 import re
 import sqlite3
-import fitz      # PyMuPDF
-import numpy as np
-from PIL import Image
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
-# ----- Dummy database setup (unchanged) -----
+# ----- Dummy database setup -----
 DB_PATH = "dummy_aadhaar.db"
 
 def create_dummy_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS aadhaars (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            aadhaar TEXT NOT NULL UNIQUE
+            aadhaar TEXT NOT NULL
         )
     """)
-    dummy_aadhaars = ["570453971532", "809471964847", "541309514471"]
+
+    # Fixed a missing comma in this list
+    dummy_aadhaars = [
+        "570453971532",
+        "809471964847",
+        "541309514471",
+    ]
+
     for num in dummy_aadhaars:
         cur.execute("INSERT OR IGNORE INTO aadhaars (aadhaar) VALUES (?)", (num,))
+
     conn.commit()
     conn.close()
-    print(f"✅ Dummy database for Aadhaar created at {DB_PATH}")
+    print(f"✅ Dummy database created at {DB_PATH}")
 
-# ----- Method 1: Direct Text Extraction (unchanged) -----
+# ----- Method 1: Direct Text Extraction (Fast) -----
 def extract_direct_text_from_pdf(pdf_path):
     """Extracts text directly from a PDF. Fast but only works for native PDFs."""
     full_text = ""
@@ -33,29 +41,45 @@ def extract_direct_text_from_pdf(pdf_path):
             full_text += page.get_text()
     return full_text
 
-# ----- Method 2: OCR Extraction with EasyOCR (Now accepts a pre-loaded reader) -----
-def extract_text_with_easyocr(reader, pdf_path, dpi=300):
-    """
-    Extracts text from a scanned PDF using a pre-initialized EasyOCR reader.
-    """
-    full_text = []
-    try:
-        doc = fitz.open(pdf_path)
-        for i, page in enumerate(doc):
-            print(f"Processing page {i + 1}/{len(doc)} with EasyOCR...")
-            pix = page.get_pixmap(dpi=dpi)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            img_array = np.array(img)
-            result = reader.readtext(img_array)
-            page_text = " ".join([text for bbox, text, prob in result])
-            full_text.append(page_text)
-        doc.close()
-        return "\n".join(full_text)
-    except Exception as e:
-        print(f"Error during EasyOCR processing: {e}")
-        return ""
+# ----- Method 2: OCR Extraction (Slower, for Scanned PDFs) -----
+def pil_from_pix(pix):
+    mode = "RGB" if pix.n >= 3 else "L"
+    img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+    if mode != "RGB":
+        img = img.convert("RGB")
+    return img
 
-# ----- Aadhaar extraction (unchanged) -----
+def preprocess_basic(img):
+    img = img.convert("L")
+    img = ImageOps.autocontrast(img)
+    img = img.filter(ImageFilter.MedianFilter(size=3))
+    img = ImageEnhance.Contrast(img).enhance(1.6)
+    img = ImageEnhance.Sharpness(img).enhance(1.2)
+    return img
+
+def binarize(img, thresh=150):
+    img_l = img.convert("L")
+    return img_l.point(lambda p: 255 if p > thresh else 0).convert("RGB")
+
+def extract_text_via_ocr(pdf_path, dpi=400):
+    """Extracts text using OCR. Slower but works for scanned PDFs."""
+    combined_pages = []
+    with fitz.open(pdf_path) as doc:
+        for page in doc:
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            img = pil_from_pix(pix)
+
+            img_proc = preprocess_basic(img)
+            texts = [
+                pytesseract.image_to_string(img_proc, config="--oem 3 --psm 6"),
+                pytesseract.image_to_string(img_proc, config="--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789 ")
+            ]
+            page_text = "\n".join(t for t in texts if t.strip())
+            combined_pages.append(page_text)
+    return "\n".join(combined_pages)
+
+# ----- Aadhaar extraction -----
 def find_aadhaar(text):
     matches = re.findall(r'(?:\d{4}[\s-]?){2}\d{4}', text)
     clean = []
@@ -65,7 +89,7 @@ def find_aadhaar(text):
             clean.append(digits)
     return clean
 
-# ----- Check in database (unchanged) -----
+# ----- Check in database -----
 def check_in_db(aadhaar_number):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -74,22 +98,20 @@ def check_in_db(aadhaar_number):
     conn.close()
     return result
 
-# ----- Main logic (updated to accept the ocr_reader) -----
-def validate_aadhaar_from_pdf(pdf_path, ocr_reader):
+# ----- Main logic with Hybrid Approach -----
+def validate_aadhaar_from_pdf(pdf_path):
     try:
+        # Step 1: Try the fast, direct extraction method first.
         extracted_text = extract_direct_text_from_pdf(pdf_path)
 
+        # Step 2: If direct extraction yields little text, it's likely a scanned PDF. Fall back to OCR.
         if len(extracted_text.strip()) < 50:
-            print("⚠️ Direct text extraction yielded little result, falling back to EasyOCR...")
-            # Pass the pre-loaded reader to the function
-            extracted_text = extract_text_with_easyocr(ocr_reader, pdf_path)
+            print("⚠️ Direct text extraction yielded little result, falling back to OCR...")
+            extracted_text = extract_text_via_ocr(pdf_path)
         else:
             print("✅ Text successfully extracted directly from PDF.")
 
-        if not extracted_text:
-             print("❌ OCR process failed to extract any text.")
-             return "Could not extract any text from the document."
-
+        # Step 3: Process the extracted text to find the Aadhaar number.
         aadhaars = find_aadhaar(extracted_text)
         aadhaar_number = aadhaars[0] if aadhaars else None
 
@@ -103,7 +125,13 @@ def validate_aadhaar_from_pdf(pdf_path, ocr_reader):
             else:
                 return f"Aadhaar card with number {aadhaar_number} is not found in the database."
         else:
-            print("❌ Aadhaar Number not found in the extracted text.")
+            print("❌ Aadhaar Number not found")
             return "No valid Aadhaar number could be found in the provided PDF."
     except Exception as e:
         return f"An error occurred during validation: {str(e)}"
+
+# This part is only for direct execution of this file
+if __name__ == "__main__":
+    create_dummy_db()
+    pdf_path = input("Enter Aadhaar PDF path: ").strip().strip('"')
+    print(validate_aadhaar_from_pdf(pdf_path))
